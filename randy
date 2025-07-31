@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# =================================================
+# FUNGSI UNTUK MELAKUKAN COMMIT
+# =================================================
+function perform_commit {
+  local commit_message=$1
+
+  echo ""
+  echo "🚀 Oke, randy mulai proses commit..."
+  
+  DUMP_FILE=".randy/temp_dump.dump"
+  
+  # Jalankan pg_dump dengan info dari config
+  PGPASSWORD="$PGPASSWORD" pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --format=custom -f "$DUMP_FILE"
+
+  if [ $? -ne 0 ]; then
+    echo "❌ Duh, gagal membuat dump database!"
+    rm -f "$DUMP_FILE" # Bersihkan file dump sementara jika gagal
+    return 1 # Keluar dari fungsi dengan status error
+  fi
+
+  # Buat ID commit dari hash file dump
+  COMMIT_ID=$(sha256sum "$DUMP_FILE" | awk '{ print $1 }')
+  
+  # Pindahkan dump ke folder objects
+  mv "$DUMP_FILE" ".randy/objects/$COMMIT_ID"
+
+  # Update pointer branch 'main' ke commit terbaru
+  echo "$COMMIT_ID" > ".randy/refs/heads/main"
+
+  # Di sini nantinya kita bisa menambahkan penyimpanan metadata commit (pesan, author, dll)
+  
+  echo "✅ Mantap! Commit berhasil dibuat dengan ID: ${COMMIT_ID:0:12}" # Tampilkan hash singkat
+}
+# Perintah utama
+case "$1" in
+  init)
+    if [ -d ".randy" ]; then
+      echo "Hehe, folder .randy nya udah ada euy."
+      exit 1
+    fi
+
+    echo "Bentar, randy butuh info koneksi database..."
+
+    read -p "Host (default: localhost): " DB_HOST
+    read -p "Nama database: " DB_NAME
+    read -p "Port (default: 5432): " DB_PORT
+    read -p "Username: " DB_USER
+    read -s -p "Password: " DB_PASS
+    echo # Tambah baris baru setelah input password
+
+    # Atur nilai default jika input kosong
+    DB_HOST=${DB_HOST:-localhost}
+    DB_PORT=${DB_PORT:-5432}
+
+    echo ""
+    echo "Oke, randy coba konek dulu ya..."
+
+    # Tes koneksi ke database
+    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --format=custom -f "$DUMP_FILE"
+
+    if [ $? -ne 0 ]; then
+      echo "❌ Duh, gagal konek euy. Coba cek lagi info databasenya."
+      exit 1
+    fi
+
+    echo "✅ Sip, koneksi berhasil!"
+    echo ""
+    echo "Bentar, randy lagi buat repositorynya yaaaa..."
+    mkdir -p .randy/{objects,refs/heads}
+    touch .randy/refs/heads/main
+    echo "ref: refs/heads/main" > .randy/HEAD
+
+    # Simpan konfigurasi ke file
+    CONFIG_FILE=".randy/config"
+    echo "export DB_HOST=\"$DB_HOST\"" > "$CONFIG_FILE"
+    echo "export DB_NAME=\"$DB_NAME\"" >> "$CONFIG_FILE"
+    echo "export DB_PORT=\"$DB_PORT\"" >> "$CONFIG_FILE"
+    echo "export DB_USER=\"$DB_USER\"" >> "$CONFIG_FILE"
+    echo "export PGPASSWORD=\"$DB_PASS\"" >> "$CONFIG_FILE"
+
+    echo "Oke Udah. Konfigurasi disimpen di $CONFIG_FILE"
+
+    echo ""
+    # Tawarkan untuk langsung commit
+    read -p "Mau langsung buat commit pertama (initial commit)? (y/n) " -n 1 -r
+    echo # Pindah baris
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      # Panggil fungsi commit dengan pesan default
+      perform_commit "Initial commit"
+    else
+      echo "Oke, repositori siap. Kamu bisa commit nanti pake 'randy commit'."
+    fi
+    ;;
+  commit)
+    # Logika untuk 'randy commit' ada di sini
+    echo "Oke dikommittttt..."
+    # ... (langkah-langkah pg_dump, hashing, dll.)
+    ;;
+  checkout)
+    # Logika untuk 'randy checkout' ada di sini
+    echo "Kita pindah duluuu..."
+    ;;
+  log)
+    # Logika untuk 'randy log' ada di sini
+    echo "Ini riwayatnya ya:"
+    ;;
+  *)
+    echo "Duh, buat sekarang perintah '$1' belum tersedia euy.."
+    echo "Yang bisa di pake: randy {init|commit|checkout|log}"
+    exit 1
+    ;;
+esac
