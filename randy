@@ -5,34 +5,57 @@
 # =================================================
 function perform_commit {
   local commit_message=$1
+  local CONFIG_FILE=".randy/config"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Konfigurasi tidak ditemukan."
+    return 1
+  fi
+  source "$CONFIG_FILE"
 
   echo ""
-  echo "🚀 Oke, randy mulai proses commit..."
+  echo "🚀 Memulai commit (Metode CSV + Sortir)..."
   
-  DUMP_FILE=".randy/temp_dump.dump"
-  
-  # Jalankan pg_dump dengan info dari config
-  PGPASSWORD="$PGPASSWORD" pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --format=custom -f "$DUMP_FILE"
+  local TEMP_DIR=$(mktemp -d -p ".randy")
+  local SCHEMA_DUMP="$TEMP_DIR/schema.sql"
+  local FINAL_HASH_INPUT="$TEMP_DIR/final_hash_input.txt"
 
-  if [ $? -ne 0 ]; then
-    echo "❌ Duh, gagal membuat dump database!"
-    rm -f "$DUMP_FILE" # Bersihkan file dump sementara jika gagal
-    return 1 # Keluar dari fungsi dengan status error
-  fi
+  # 1. Dump skema
+  pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP"
 
-  # Buat ID commit dari hash file dump
-  COMMIT_ID=$(sha256sum "$DUMP_FILE" | awk '{ print $1 }')
-  
-  # Pindahkan dump ke folder objects
-  mv "$DUMP_FILE" ".randy/objects/$COMMIT_ID"
+  # 2. Dapatkan daftar tabel DAN view beserta tipenya
+  OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
 
-  # Update pointer branch 'main' ke commit terbaru
+  cat "$SCHEMA_DUMP" > "$FINAL_HASH_INPUT"
+
+  # 3. Loop setiap objek
+  echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
+    if [ -z "$object_name" ]; then continue; fi
+
+    echo "   -> Memproses ($object_type): $object_name"
+    local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv" # Ganti titik dengan underscore untuk nama file
+    local COPY_COMMAND=""
+
+    # Tentukan perintah COPY berdasarkan tipe objek
+    if [ "$object_type" == "BASE TABLE" ]; then
+      COPY_COMMAND="COPY $object_name TO STDOUT WITH CSV"
+    elif [ "$object_type" == "VIEW" ]; then
+      COPY_COMMAND="COPY (SELECT * FROM $object_name) TO STDOUT WITH CSV"
+    else
+      continue # Lewati tipe lain jika ada
+    fi
+
+    psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$SORTED_DATA_FILE"
+    cat "$SORTED_DATA_FILE" >> "$FINAL_HASH_INPUT"
+  done
+
+  # 4. Hitung hash, arsipkan, dan bersihkan
+  local COMMIT_ID=$(sha256sum "$FINAL_HASH_INPUT" | awk '{ print $1 }')
+  tar -czf ".randy/objects/$COMMIT_ID" -C "$TEMP_DIR" .
+  rm -rf "$TEMP_DIR"
   echo "$COMMIT_ID" > ".randy/refs/heads/main"
-
-  # Di sini nantinya kita bisa menambahkan penyimpanan metadata commit (pesan, author, dll)
-  
-  echo "✅ Mantap! Commit berhasil dibuat dengan ID: ${COMMIT_ID:0:12}" # Tampilkan hash singkat
+  echo "✅ Mantap! Commit berhasil dibuat dengan ID: ${COMMIT_ID:0:12}"
 }
+
 # Perintah utama
 case "$1" in
   init)
@@ -58,7 +81,7 @@ case "$1" in
     echo "Oke, randy coba konek dulu ya..."
 
     # Tes koneksi ke database
-    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --format=custom -f "$DUMP_FILE"
+    PGPASSWORD="$DB_PASS" psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "\q" 2>/dev/null
 
     if [ $? -ne 0 ]; then
       echo "❌ Duh, gagal konek euy. Coba cek lagi info databasenya."
@@ -94,6 +117,66 @@ case "$1" in
       echo "Oke, repositori siap. Kamu bisa commit nanti pake 'randy commit'."
     fi
     ;;
+
+  status)
+    if [ ! -f ".randy/config" ]; then
+      echo "Duh, ini bukan repositori randy. Jalanin 'randy init' dulu."
+      exit 1
+    fi
+
+    source .randy/config
+
+    LATEST_COMMIT_ID=$(cat .randy/refs/heads/main)
+    if [ -z "$LATEST_COMMIT_ID" ]; then
+      echo "Belum ada commit sama sekali di repositori ini."
+      exit 0
+    fi
+
+    echo "Saat ini berada di commit: ${LATEST_COMMIT_ID:0:12}"
+    echo "Mengecek status database (bisa untuk tabel & view)..."
+
+    # Hapus 'local' dari baris-baris di bawah ini
+    TEMP_DIR=$(mktemp -d -p ".randy")
+    SCHEMA_DUMP="$TEMP_DIR/schema.sql"
+    FINAL_HASH_INPUT="$TEMP_DIR/final_hash_input.txt"
+
+    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP" > /dev/null 2>&1
+    OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
+    cat "$SCHEMA_DUMP" > "$FINAL_HASH_INPUT"
+
+    echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
+      if [ -z "$object_name" ]; then continue; fi
+      
+      # Hapus 'local' dari baris-baris di bawah ini
+      SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv"
+      COPY_COMMAND=""
+
+      if [ "$object_type" == "BASE TABLE" ]; then
+        COPY_COMMAND="COPY $object_name TO STDOUT WITH CSV"
+      elif [ "$object_type" == "VIEW" ]; then
+        COPY_COMMAND="COPY (SELECT * FROM $object_name) TO STDOUT WITH CSV"
+      else
+        continue
+      fi
+
+      psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$SORTED_DATA_FILE"
+      cat "$SORTED_DATA_FILE" >> "$FINAL_HASH_INPUT"
+    done
+
+    # Hapus 'local' dari sini
+    CURRENT_HASH=$(sha256sum "$FINAL_HASH_INPUT" | awk '{ print $1 }')
+
+    rm -rf "$TEMP_DIR"
+
+    if [ "$CURRENT_HASH" == "$LATEST_COMMIT_ID" ]; then
+      echo "✅ Database bersih, tidak ada perubahan sejak commit terakhir."
+    else
+      echo "⚠️  Database telah dimodifikasi."
+      echo "   (Ada perubahan yang belum di-commit)"
+      echo "   Jalankan 'randy commit' untuk menyimpan perubahan."
+    fi
+    ;;
+
   commit)
     # Logika untuk 'randy commit' ada di sini
     echo "Oke dikommittttt..."
