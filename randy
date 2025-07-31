@@ -131,7 +131,9 @@ case "$1" in
     echo "Oke Udah. Konfigurasi disimpen di $CONFIG_FILE"
 
     echo ""
-    echo "Oke, repositori siap. Kamu bisa commit nanti pake 'randy commit'."
+    echo "Oke, repositori siap. Kamu bisa atur nama dan email terlebih dahulu:"
+    echo "   randy config user.name \"Nama kamu\""
+    echo "   randy config user.email \"email@kamu.com\""
     ;;
 
   status)
