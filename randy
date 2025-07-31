@@ -5,51 +5,78 @@
 # =================================================
 function perform_commit {
   local commit_message=$1
-  local CONFIG_FILE=".randy/config"
-  if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ Konfigurasi tidak ditemukan."
+  
+  # Muat konfigurasi global (untuk user) dan lokal (untuk DB)
+  GLOBAL_CONFIG_FILE="$HOME/.randyconfig"
+  LOCAL_CONFIG_FILE=".randy/config"
+  if [ -f "$GLOBAL_CONFIG_FILE" ]; then source "$GLOBAL_CONFIG_FILE"; fi
+  if [ ! -f "$LOCAL_CONFIG_FILE" ]; then
+    echo "❌ Konfigurasi database tidak ditemukan. Jalankan 'randy init' dulu."
     return 1
   fi
-  source "$CONFIG_FILE"
+  source "$LOCAL_CONFIG_FILE"
 
+  # 1. Validasi apakah nama dan email sudah di-set
+  if [ -z "$user_name" ] || [ -z "$user_email" ]; then
+    echo "❌ Error: Identitas Anda belum diatur."
+    echo "   Silakan atur nama dan email Anda terlebih dahulu:"
+    echo "   randy config user.name \"Nama Anda\""
+    echo "   randy config user.email \"email@anda.com\""
+    return 1
+  fi
+  
   echo ""
-  echo "🚀 Memulai commit (Metode CSV + Sortir)..."
+  echo "🚀 Memulai commit..."
   
   local TEMP_DIR=$(mktemp -d -p ".randy")
   local SCHEMA_DUMP="$TEMP_DIR/schema.sql"
   local FINAL_HASH_INPUT="$TEMP_DIR/final_hash_input.txt"
+  
+  # 2. Ambil ID parent commit SEBELUM diubah
+  local PARENT_COMMIT_ID=$(cat .randy/refs/heads/main 2>/dev/null)
 
-  # 1. Dump skema
+  # 3. Dump skema
   pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP"
 
-  # 2. Dapatkan daftar tabel DAN view beserta tipenya
+  # 4. Dapatkan daftar tabel & view, lalu ekspor dan urutkan datanya
   OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
-
   cat "$SCHEMA_DUMP" > "$FINAL_HASH_INPUT"
 
-  # 3. Loop setiap objek
   echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
     if [ -z "$object_name" ]; then continue; fi
-    local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv" # Ganti titik dengan underscore untuk nama file
+    local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv"
     local COPY_COMMAND=""
 
-    # Tentukan perintah COPY berdasarkan tipe objek
     if [ "$object_type" == "BASE TABLE" ]; then
       COPY_COMMAND="COPY $object_name TO STDOUT WITH CSV"
     elif [ "$object_type" == "VIEW" ]; then
       COPY_COMMAND="COPY (SELECT * FROM $object_name) TO STDOUT WITH CSV"
     else
-      continue # Lewati tipe lain jika ada
+      continue
     fi
 
     psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$SORTED_DATA_FILE"
     cat "$SORTED_DATA_FILE" >> "$FINAL_HASH_INPUT"
-  done
+  done < <(echo "$OBJECT_LIST") # Menggunakan process substitution
 
-  # 4. Hitung hash, arsipkan, dan bersihkan
+  # 5. Buat file metadata untuk commit
+  local META_FILE="$TEMP_DIR/commit.meta"
+  local AUTHOR="$user_name <$user_email>"
+
+  echo "parent: $PARENT_COMMIT_ID" > "$META_FILE"
+  echo "date: $(date -u "+%Y-%m-%dT%H:%M:%SZ")" >> "$META_FILE"
+  echo "author: $AUTHOR" >> "$META_FILE"
+  echo "message: $commit_message" >> "$META_FILE"
+
+  # 6. Tambahkan file metadata ke file gabungan untuk di-hash
+  cat "$META_FILE" >> "$FINAL_HASH_INPUT"
+  
+  # 7. Hitung hash, arsipkan, dan bersihkan
   local COMMIT_ID=$(sha256sum "$FINAL_HASH_INPUT" | awk '{ print $1 }')
   tar -czf ".randy/objects/$COMMIT_ID" -C "$TEMP_DIR" .
   rm -rf "$TEMP_DIR"
+  
+  # 8. Update referensi HEAD
   echo "$COMMIT_ID" > ".randy/refs/heads/main"
   echo "✅ Mantap! Commit berhasil dibuat dengan ID: ${COMMIT_ID:0:12}"
 }
@@ -104,16 +131,7 @@ case "$1" in
     echo "Oke Udah. Konfigurasi disimpen di $CONFIG_FILE"
 
     echo ""
-    # Tawarkan untuk langsung commit
-    read -p "Mau langsung buat commit pertama (initial commit)? (y/n) " -n 1 -r
-    echo # Pindah baris
-    
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      # Panggil fungsi commit dengan pesan default
-      perform_commit "Initial commit"
-    else
-      echo "Oke, repositori siap. Kamu bisa commit nanti pake 'randy commit'."
-    fi
+    echo "Oke, repositori siap. Kamu bisa commit nanti pake 'randy commit'."
     ;;
 
   status)
@@ -131,7 +149,7 @@ case "$1" in
     fi
 
     echo "Saat ini berada di commit: ${LATEST_COMMIT_ID:0:12}"
-    echo "Mengecek status database (mode diff)..."
+    echo "Mengecek status database..."
 
     OLD_DATA_DIR=$(mktemp -d -p ".randy")
     NEW_DATA_DIR=$(mktemp -d -p ".randy")
@@ -197,13 +215,109 @@ case "$1" in
       exit 1
     fi
     ;;
+
+  log)
+    if [ ! -f ".randy/refs/heads/main" ]; then
+      echo "Duh, ini bukan repositori randy atau belum ada commit."
+      exit 1
+    fi
+
+    # Ambil commit paling akhir sebagai titik awal
+    COMMIT_ID=$(cat .randy/refs/heads/main)
+
+    if [ -z "$COMMIT_ID" ]; then
+      echo "Belum ada commit di repositori ini."
+      exit 0
+    fi
+
+    # Definisi warna untuk output
+    COLOR_YELLOW='\033[0;33m'
+    COLOR_RESET='\033[0m'
+
+    # Loop mundur mengikuti parent commit
+    while [ -n "$COMMIT_ID" ]; do
+      COMMIT_OBJECT_FILE=".randy/objects/$COMMIT_ID"
+      if [ ! -f "$COMMIT_OBJECT_FILE" ]; then
+        echo "❌ Error: Objek commit $COMMIT_ID tidak ditemukan."
+        break
+      fi
+
+      # Ekstrak file metadata dari arsip
+      METADATA=$(tar -xzf "$COMMIT_OBJECT_FILE" -O ./commit.meta 2>/dev/null)
+      
+      if [ -z "$METADATA" ]; then
+        echo "❌ Error: Gagal membaca metadata dari commit $COMMIT_ID"
+        break
+      fi
+
+      # Parsing setiap baris dari metadata
+      AUTHOR=$(echo "$METADATA" | grep '^author:' | sed 's/author: //')
+      DATE=$(echo "$METADATA" | grep '^date:' | sed 's/date: //')
+      MESSAGE=$(echo "$METADATA" | grep '^message:' | sed 's/message: //')
+      
+      # Tampilkan log dengan format mirip 'git log'
+      echo -e "${COLOR_YELLOW}commit $COMMIT_ID${COLOR_RESET}"
+      echo "Author: $AUTHOR"
+      echo "Date:   $DATE"
+      echo ""
+      echo "    $MESSAGE"
+      echo ""
+
+      # Ambil ID parent untuk iterasi selanjutnya
+      PARENT_ID=$(echo "$METADATA" | grep '^parent:' | sed 's/parent: //')
+      COMMIT_ID="$PARENT_ID"
+    done
+    ;;
   checkout)
     # Logika untuk 'randy checkout' ada di sini
     echo "Kita pindah duluuu..."
     ;;
-  log)
-    # Logika untuk 'randy log' ada di sini
-    echo "Ini riwayatnya ya:"
+
+  config)
+    # File konfigurasi lokal di dalam direktori .randy
+    LOCAL_CONFIG_FILE=".randy/config"
+    
+    # Pastikan repositori sudah di-init dulu
+    if [ ! -d ".randy" ]; then
+      echo "❌ Error: Ini bukan repositori randy. Jalankan 'randy init' dulu."
+      exit 1
+    fi
+    
+    # Pastikan format perintah benar
+    if [ "$#" -ne 3 ]; then
+      echo "❌ Error: format perintah salah."
+      echo "   Penggunaan: randy config user.name \"Nama Anda\""
+      exit 1
+    fi
+    
+    KEY=$2
+    VALUE=$3
+    SHELL_SAFE_KEY=""
+
+    # Terjemahkan key yang menggunakan titik menjadi garis bawah
+    case "$KEY" in
+      user.name)
+        SHELL_SAFE_KEY="user_name"
+        ;;
+      user.email)
+        SHELL_SAFE_KEY="user_email"
+        ;;
+      *)
+        echo "❌ Error: Kunci konfigurasi '$KEY' tidak dikenal."
+        exit 1
+        ;;
+    esac
+
+    # Cek apakah key sudah ada di file config
+    if grep -q "^export ${SHELL_SAFE_KEY}=" "$LOCAL_CONFIG_FILE" 2>/dev/null; then
+      # Jika ada, ganti nilainya
+      sed -i "s|^export ${SHELL_SAFE_KEY}=.*|export ${SHELL_SAFE_KEY}=\"${VALUE}\"|" "$LOCAL_CONFIG_FILE"
+    else
+      # Jika tidak ada, tambahkan baris baru
+      echo "export ${SHELL_SAFE_KEY}=\"${VALUE}\"" >> "$LOCAL_CONFIG_FILE"
+    fi
+    
+    echo "✅ Konfigurasi '$KEY' berhasil disimpan."
     ;;
   *)
     echo "Duh, buat sekarang perintah '$1' belum tersedia euy.."
