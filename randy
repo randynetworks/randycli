@@ -30,8 +30,6 @@ function perform_commit {
   # 3. Loop setiap objek
   echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
     if [ -z "$object_name" ]; then continue; fi
-
-    echo "   -> Memproses ($object_type): $object_name"
     local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv" # Ganti titik dengan underscore untuk nama file
     local COPY_COMMAND=""
 
@@ -135,20 +133,18 @@ case "$1" in
     echo "Saat ini berada di commit: ${LATEST_COMMIT_ID:0:12}"
     echo "Mengecek status database (mode diff)..."
 
-    # 1. Siapkan direktori temporer untuk data lama dan baru
     OLD_DATA_DIR=$(mktemp -d -p ".randy")
     NEW_DATA_DIR=$(mktemp -d -p ".randy")
     
-    # 2. Ekstrak data dari commit terakhir ke OLD_DATA_DIR
     tar -xzf ".randy/objects/$LATEST_COMMIT_ID" -C "$OLD_DATA_DIR"
 
-    # 3. Buat snapshot data saat ini ke NEW_DATA_DIR
     SCHEMA_DUMP_NEW="$NEW_DATA_DIR/schema.sql"
     pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP_NEW" > /dev/null 2>&1
     OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
     
-    $HAS_CHANGES=false
-    echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
+    HAS_CHANGES=false
+    
+    while IFS='|' read -r object_type object_name; do
       if [ -z "$object_name" ]; then continue; fi
       
       FILE_NAME="${object_name//\./_}.csv"
@@ -166,12 +162,11 @@ case "$1" in
 
       psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$NEW_FILE"
 
-      # 4. Bandingkan file lama dan baru
       DIFF_OUTPUT=$(diff "$OLD_FILE" "$NEW_FILE")
       if [ -n "$DIFF_OUTPUT" ]; then
         if ! $HAS_CHANGES; then
             echo "⚠️  Database telah dimodifikasi. Perubahan terdeteksi:"
-            $HAS_CHANGES=true
+            HAS_CHANGES=true
         fi
         echo "--------------------------------------------------"
         echo "Perubahan pada ($object_type): $object_name"
@@ -179,9 +174,8 @@ case "$1" in
         echo "$DIFF_OUTPUT"
         echo ""
       fi
-    done
+    done < <(echo "$OBJECT_LIST") 
 
-    # 5. Bersihkan direktori temporer
     rm -rf "$OLD_DATA_DIR" "$NEW_DATA_DIR"
 
     if ! $HAS_CHANGES; then
@@ -190,9 +184,18 @@ case "$1" in
     ;;
 
   commit)
-    # Logika untuk 'randy commit' ada di sini
-    echo "Oke dikommittttt..."
-    # ... (langkah-langkah pg_dump, hashing, dll.)
+    # Cek apakah argumen kedua adalah '-m' dan argumen ketiga (pesannya) tidak kosong
+    if [ "$2" == "-m" ] && [ -n "$3" ]; then
+      # Geser argumen, buang 'randy' dan '-m'
+      shift 2 
+      # Ambil sisa argumen sebagai satu pesan utuh
+      commit_message="$*"
+      perform_commit "$commit_message"
+    else
+      echo "❌ Error: pesan commit dibutuhkan."
+      echo "   Penggunaan: randy commit -m \"Pesan commit Anda\""
+      exit 1
+    fi
     ;;
   checkout)
     # Logika untuk 'randy checkout' ada di sini
