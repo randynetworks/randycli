@@ -133,22 +133,27 @@ case "$1" in
     fi
 
     echo "Saat ini berada di commit: ${LATEST_COMMIT_ID:0:12}"
-    echo "Mengecek status database (bisa untuk tabel & view)..."
+    echo "Mengecek status database (mode diff)..."
 
-    # Hapus 'local' dari baris-baris di bawah ini
-    TEMP_DIR=$(mktemp -d -p ".randy")
-    SCHEMA_DUMP="$TEMP_DIR/schema.sql"
-    FINAL_HASH_INPUT="$TEMP_DIR/final_hash_input.txt"
+    # 1. Siapkan direktori temporer untuk data lama dan baru
+    OLD_DATA_DIR=$(mktemp -d -p ".randy")
+    NEW_DATA_DIR=$(mktemp -d -p ".randy")
+    
+    # 2. Ekstrak data dari commit terakhir ke OLD_DATA_DIR
+    tar -xzf ".randy/objects/$LATEST_COMMIT_ID" -C "$OLD_DATA_DIR"
 
-    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP" > /dev/null 2>&1
+    # 3. Buat snapshot data saat ini ke NEW_DATA_DIR
+    SCHEMA_DUMP_NEW="$NEW_DATA_DIR/schema.sql"
+    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP_NEW" > /dev/null 2>&1
     OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
-    cat "$SCHEMA_DUMP" > "$FINAL_HASH_INPUT"
-
+    
+    $HAS_CHANGES=false
     echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
       if [ -z "$object_name" ]; then continue; fi
       
-      # Hapus 'local' dari baris-baris di bawah ini
-      SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv"
+      FILE_NAME="${object_name//\./_}.csv"
+      OLD_FILE="$OLD_DATA_DIR/$FILE_NAME"
+      NEW_FILE="$NEW_DATA_DIR/$FILE_NAME"
       COPY_COMMAND=""
 
       if [ "$object_type" == "BASE TABLE" ]; then
@@ -159,21 +164,28 @@ case "$1" in
         continue
       fi
 
-      psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$SORTED_DATA_FILE"
-      cat "$SORTED_DATA_FILE" >> "$FINAL_HASH_INPUT"
+      psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$NEW_FILE"
+
+      # 4. Bandingkan file lama dan baru
+      DIFF_OUTPUT=$(diff "$OLD_FILE" "$NEW_FILE")
+      if [ -n "$DIFF_OUTPUT" ]; then
+        if ! $HAS_CHANGES; then
+            echo "⚠️  Database telah dimodifikasi. Perubahan terdeteksi:"
+            $HAS_CHANGES=true
+        fi
+        echo "--------------------------------------------------"
+        echo "Perubahan pada ($object_type): $object_name"
+        echo "--------------------------------------------------"
+        echo "$DIFF_OUTPUT"
+        echo ""
+      fi
     done
 
-    # Hapus 'local' dari sini
-    CURRENT_HASH=$(sha256sum "$FINAL_HASH_INPUT" | awk '{ print $1 }')
+    # 5. Bersihkan direktori temporer
+    rm -rf "$OLD_DATA_DIR" "$NEW_DATA_DIR"
 
-    rm -rf "$TEMP_DIR"
-
-    if [ "$CURRENT_HASH" == "$LATEST_COMMIT_ID" ]; then
-      echo "✅ Database bersih, tidak ada perubahan sejak commit terakhir."
-    else
-      echo "⚠️  Database telah dimodifikasi."
-      echo "   (Ada perubahan yang belum di-commit)"
-      echo "   Jalankan 'randy commit' untuk menyimpan perubahan."
+    if ! $HAS_CHANGES; then
+        echo "✅ Database bersih, tidak ada perubahan sejak commit terakhir."
     fi
     ;;
 
