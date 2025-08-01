@@ -1,50 +1,71 @@
 #!/bin/bash
 
+function perform_reset {
+  local TARGET_COMMIT_ID=$1
+  
+  COMMIT_OBJECT_FILE=".randy/objects/$TARGET_COMMIT_ID"
+  if [ ! -f "$COMMIT_OBJECT_FILE" ]; then
+    echo "❌ Error: Objek commit '$TARGET_COMMIT_ID' tidak ditemukan."
+    return 1 # Keluar dari fungsi dengan status error
+  fi
+
+  echo "🚀 Memulai proses restore ke commit ${TARGET_COMMIT_ID:0:12}..."
+  
+  TEMP_DUMP_FILE=$(mktemp -p ".randy" "reset_dump_XXXX.dump")
+  tar -xzf "$COMMIT_OBJECT_FILE" -O ./full_backup.dump > "$TEMP_DUMP_FILE"
+
+  echo "   -> Merestore database dari dump..."
+  pg_restore --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --clean "$TEMP_DUMP_FILE"
+
+  if [ $? -ne 0 ]; then
+    echo "❌ Error: Proses pg_restore gagal."
+    rm -f "$TEMP_DUMP_FILE"
+    return 1 # Keluar dari fungsi dengan status error
+  fi
+  
+  rm -f "$TEMP_DUMP_FILE"
+}
+
 # =================================================
 # FUNGSI UNTUK MELAKUKAN COMMIT
 # =================================================
 function perform_commit {
   local commit_message=$1
   
-  # Muat konfigurasi global (untuk user) dan lokal (untuk DB)
-  GLOBAL_CONFIG_FILE="$HOME/.randyconfig"
-  LOCAL_CONFIG_FILE=".randy/config"
-  if [ -f "$GLOBAL_CONFIG_FILE" ]; then source "$GLOBAL_CONFIG_FILE"; fi
-  if [ ! -f "$LOCAL_CONFIG_FILE" ]; then
+  # Muat konfigurasi
+  source "$HOME/.randyconfig" 2>/dev/null
+  if [ ! -f ".randy/config" ]; then
     echo "❌ Konfigurasi database tidak ditemukan. Jalankan 'randy init' dulu."
     return 1
   fi
-  source "$LOCAL_CONFIG_FILE"
+  source ".randy/config"
 
-  # 1. Validasi apakah nama dan email sudah di-set
+  # Validasi user
   if [ -z "$user_name" ] || [ -z "$user_email" ]; then
     echo "❌ Error: Identitas Anda belum diatur."
-    echo "   Silakan atur nama dan email Anda terlebih dahulu:"
-    echo "   randy config user.name \"Nama Anda\""
-    echo "   randy config user.email \"email@anda.com\""
+    echo "   Gunakan: randy config user.name \"Nama Anda\""
     return 1
   fi
   
   echo ""
-  echo "🚀 Memulai commit..."
+  echo "🚀 Memulai commit (Paradigma Baru: CSV + Full Dump)..."
   
   local TEMP_DIR=$(mktemp -d -p ".randy")
   local SCHEMA_DUMP="$TEMP_DIR/schema.sql"
   local FINAL_HASH_INPUT="$TEMP_DIR/final_hash_input.txt"
-  
-  # 2. Ambil ID parent commit SEBELUM diubah
   local PARENT_COMMIT_ID=$(cat .randy/refs/heads/main 2>/dev/null)
 
-  # 3. Dump skema
+  # 1. Dump skema
   pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP"
 
-  # 4. Dapatkan daftar tabel & view, lalu ekspor dan urutkan datanya
+  # 2. Dump data ke file CSV terurut (untuk 'status')
   OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
   cat "$SCHEMA_DUMP" > "$FINAL_HASH_INPUT"
 
-  echo "$OBJECT_LIST" | while IFS='|' read -r object_type object_name; do
+  while IFS='|' read -r object_type object_name; do
     if [ -z "$object_name" ]; then continue; fi
-    local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./_}.csv"
+    echo "   -> Memproses ($object_type): $object_name"
+    local SORTED_DATA_FILE="$TEMP_DIR/${object_name//\./__}.csv"
     local COPY_COMMAND=""
 
     if [ "$object_type" == "BASE TABLE" ]; then
@@ -57,26 +78,31 @@ function perform_commit {
 
     psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$SORTED_DATA_FILE"
     cat "$SORTED_DATA_FILE" >> "$FINAL_HASH_INPUT"
-  done < <(echo "$OBJECT_LIST") # Menggunakan process substitution
+  done < <(echo "$OBJECT_LIST")
 
-  # 5. Buat file metadata untuk commit
+  # 3. Buat file metadata
   local META_FILE="$TEMP_DIR/commit.meta"
   local AUTHOR="$user_name <$user_email>"
-
   echo "parent: $PARENT_COMMIT_ID" > "$META_FILE"
   echo "date: $(date -u "+%Y-%m-%dT%H:%M:%SZ")" >> "$META_FILE"
   echo "author: $AUTHOR" >> "$META_FILE"
   echo "message: $commit_message" >> "$META_FILE"
-
-  # 6. Tambahkan file metadata ke file gabungan untuk di-hash
   cat "$META_FILE" >> "$FINAL_HASH_INPUT"
   
-  # 7. Hitung hash, arsipkan, dan bersihkan
+  # 4. Hitung hash HANYA dari data deterministik (skema + csv + meta)
   local COMMIT_ID=$(sha256sum "$FINAL_HASH_INPUT" | awk '{ print $1 }')
+
+  # 5. BUAT FULL DUMP (untuk 'reset' yang lebih cepat)
+  echo "   -> Membuat full backup (.dump)..."
+  local FULL_DUMP_FILE="$TEMP_DIR/full_backup.dump"
+  pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --format=custom -f "$FULL_DUMP_FILE"
+
+  # 6. Arsipkan SEMUA file di direktori temporer
   tar -czf ".randy/objects/$COMMIT_ID" -C "$TEMP_DIR" .
+  
+  # 7. Bersihkan
   rm -rf "$TEMP_DIR"
   
-  # 8. Update referensi HEAD
   echo "$COMMIT_ID" > ".randy/refs/heads/main"
   echo "✅ Mantap! Commit berhasil dibuat dengan ID: ${COMMIT_ID:0:12}"
 }
@@ -151,15 +177,13 @@ case "$1" in
     fi
 
     echo "Saat ini berada di commit: ${LATEST_COMMIT_ID:0:12}"
-    echo "Mengecek status database..."
+    echo "Mengecek status database (mode diff)..."
 
     OLD_DATA_DIR=$(mktemp -d -p ".randy")
     NEW_DATA_DIR=$(mktemp -d -p ".randy")
     
     tar -xzf ".randy/objects/$LATEST_COMMIT_ID" -C "$OLD_DATA_DIR"
 
-    SCHEMA_DUMP_NEW="$NEW_DATA_DIR/schema.sql"
-    pg_dump --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --schema-only -f "$SCHEMA_DUMP_NEW" > /dev/null 2>&1
     OBJECT_LIST=$(psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -t -A -F'|' -c "SELECT table_type, table_schema || '.' || table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 2;")
     
     HAS_CHANGES=false
@@ -167,7 +191,7 @@ case "$1" in
     while IFS='|' read -r object_type object_name; do
       if [ -z "$object_name" ]; then continue; fi
       
-      FILE_NAME="${object_name//\./_}.csv"
+      FILE_NAME="${object_name//\./__}.csv"
       OLD_FILE="$OLD_DATA_DIR/$FILE_NAME"
       NEW_FILE="$NEW_DATA_DIR/$FILE_NAME"
       COPY_COMMAND=""
@@ -180,21 +204,37 @@ case "$1" in
         continue
       fi
 
+      # Buat file CSV baru dari database live
       psql --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" -c "$COPY_COMMAND" | sort > "$NEW_FILE"
 
-      DIFF_OUTPUT=$(diff "$OLD_FILE" "$NEW_FILE")
-      if [ -n "$DIFF_OUTPUT" ]; then
+      # --- LOGIKA BARU DIMULAI DI SINI ---
+      # Cek apakah file ini ada di commit sebelumnya
+      if [ ! -f "$OLD_FILE" ]; then
+        # Jika tidak ada, ini adalah objek BARU
         if ! $HAS_CHANGES; then
             echo "⚠️  Database telah dimodifikasi. Perubahan terdeteksi:"
             HAS_CHANGES=true
         fi
         echo "--------------------------------------------------"
-        echo "Perubahan pada ($object_type): $object_name"
+        echo "Baru   ($object_type): $object_name"
         echo "--------------------------------------------------"
-        echo "$DIFF_OUTPUT"
         echo ""
+      else
+        # Jika ada, bandingkan isinya (objek DIUBAH)
+        DIFF_OUTPUT=$(diff "$OLD_FILE" "$NEW_FILE")
+        if [ -n "$DIFF_OUTPUT" ]; then
+          if ! $HAS_CHANGES; then
+              echo "⚠️  Database telah dimodifikasi. Perubahan terdeteksi:"
+              HAS_CHANGES=true
+          fi
+          echo "--------------------------------------------------"
+          echo "Diubah ($object_type): $object_name"
+          echo "--------------------------------------------------"
+          echo "$DIFF_OUTPUT"
+          echo ""
+        fi
       fi
-    done < <(echo "$OBJECT_LIST") 
+    done < <(echo "$OBJECT_LIST")
 
     rm -rf "$OLD_DATA_DIR" "$NEW_DATA_DIR"
 
@@ -270,9 +310,58 @@ case "$1" in
       COMMIT_ID="$PARENT_ID"
     done
     ;;
+
+  reset)
+    if [ "$2" != "--hard" ]; then
+      echo "❌ Error: Hanya mendukung '--hard'."
+      exit 1
+    fi
+    source .randy/config
+    
+    # Ambil ID commit dari argumen, atau default ke commit terakhir
+    TARGET_COMMIT_ID=${3:-$(cat .randy/refs/heads/main)}
+    
+    # Konfirmasi pengguna
+    echo "⚠️  PERINGATAN: Perintah ini akan MENGHAPUS semua data di database '$DB_NAME'."
+    read -p "Apakah Anda benar-benar yakin? (ketik 'yes' untuk melanjutkan): " CONFIRMATION
+    if [ "$CONFIRMATION" != "yes" ]; then
+      echo "Reset dibatalkan."
+      exit 0
+    fi
+    
+    # Panggil fungsi reset
+    if perform_reset "$TARGET_COMMIT_ID"; then
+      # Update pointer 'main' HANYA jika reset berhasil
+      echo "$TARGET_COMMIT_ID" > .randy/refs/heads/main
+      echo "✅ Reset --hard berhasil. Pointer 'main' sekarang menunjuk ke ${TARGET_COMMIT_ID:0:12}."
+    fi
+    ;;
+
   checkout)
-    # Logika untuk 'randy checkout' ada di sini
-    echo "Kita pindah duluuu..."
+    TARGET_COMMIT_ID=$2
+    if [ -z "$TARGET_COMMIT_ID" ]; then
+      echo "❌ Error: ID commit dibutuhkan."
+      echo "   Penggunaan: randy checkout <commit-id>"
+      exit 1
+    fi
+
+    source .randy/config
+
+    # Konfirmasi pengguna (opsional, tapi disarankan untuk operasi database)
+    echo "Perintah ini akan mengubah database Anda agar cocok dengan commit ${TARGET_COMMIT_ID:0:12}."
+    read -p "Lanjutkan? (y/n) " -n 1 -r
+    echo # Pindah baris
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      echo "Checkout dibatalkan."
+      exit 0
+    fi
+
+    # Panggil fungsi reset
+    if perform_reset "$TARGET_COMMIT_ID"; then
+      # Update pointer 'main' HANYA jika checkout berhasil
+      echo "$TARGET_COMMIT_ID" > .randy/refs/heads/main
+      echo "✅ Checkout berhasil. Pointer 'main' sekarang menunjuk ke ${TARGET_COMMIT_ID:0:12}."
+    fi
     ;;
 
   config)
