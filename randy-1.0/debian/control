@@ -1,0 +1,13 @@
+Source: randy
+Section: utils
+Priority: optional
+Maintainer: Nama Anda <email@anda.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.5.0
+
+Package: randy
+Architecture: all
+Depends: postgresql-client, ${misc:Depends}
+Description: Simple VCS for PostgreSQL Databases
+ A Git-like version control system for PostgreSQL databases,
+ allowing for commits, status checks, and rollbacks.

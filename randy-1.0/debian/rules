@@ -1,0 +1,7 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_install:
+	mkdir -p $(CURDIR)/debian/randy/usr/local/bin
+	cp $(CURDIR)/randy $(CURDIR)/debian/randy/usr/local/bin/
